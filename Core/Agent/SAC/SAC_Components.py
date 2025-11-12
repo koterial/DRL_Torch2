@@ -1,7 +1,7 @@
 import copy
 import torch
 import torch.nn.functional as F
-from Core.Agent.Actor_Critic.Actor import Deterministic_Actor
+from Core.Agent.Actor_Critic.Actor import Gaussian_Actor
 from Core.Agent.Actor_Critic.Critic import Twin_Q_Critic
 from Core.Agent.Utils.Common import clip_by_local_norm, update_target_model
 from Core.Buffer.Buffer_Create import buffer_create
@@ -9,7 +9,7 @@ from Core.Buffer.Buffer_Create import buffer_create
 torch.set_default_dtype(torch.float32)
 
 
-class TD3_Agent():
+class SAC_Agent():
     def __init__(self, *args, **kwargs):
         #  --- 1. 弹出所有非简单类型的对象 ---
         self.buffer_config = kwargs.pop("buffer_config")
@@ -25,8 +25,9 @@ class TD3_Agent():
         # --- 3. 获取算法超参数 ---
         self.actor_lr = self.config.get("actor_lr", 1e-3)
         self.critic_lr = self.config.get("critic_lr", 1e-3)
-        self.actor_train_freq = self.config.get("actor_train_freq", 2)
+        self.alpha_lr = self.config.get("alpha_lr", 1e-3)
         self.reward_gamma = self.config.get("reward_gamma", 0.99)
+        self.actor_train_freq = self.config.get("actor_train_freq", 1)
         self.update_freq = self.config.get("update_freq", 2)
         self.update_tau = self.config.get("update_tau", 0.005)
         self.clip_norm = self.config.get("clip_norm", 0.5)
@@ -34,14 +35,23 @@ class TD3_Agent():
 
         self.actor_hidden_shape = self.config.get("actor_hidden_shape", [256, 256])
         self.critic_hidden_shape = self.config.get("critic_hidden_shape", [256, 256])
-        self.actor_activation = self.config.get("actor_activation", "tanh")
+        self.actor_activation = self.config.get("actor_activation", ["tanh", "linear"])
         self.critic_activation = self.config.get("critic_activation", "linear")
         self.hidden_activation = self.config.get("hidden_activation", "relu")
 
-        self.action_bound = self.config.get("action_bound", 1.0)
-        self.eval_noise_std = self.config.get("eval_noise_std", 0.2)
-        self.eval_noise_bound = self.config.get("eval_noise_bound", 0.2)
-        self.eval_noise_decay = self.config.get("eval_noise_decay", 0.999)
+        self.min_log_std = self.config.get("min_log_std", -20)
+        self.max_log_std = self.config.get("max_log_std", 2)
+        self.log_prob_epsilon = self.config.get("log_prob_epsilon", 1e-6)
+
+        self.auto_alpha = self.config.get("auto_alpha", True)
+        if self.auto_alpha:
+            self.target_entropy = -torch.prod(torch.Tensor(self.action_shape).to(self.device)).item()
+            self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
+            self.alpha_opt = torch.optim.Adam([self.log_alpha], lr=self.alpha_lr)
+            self.alpha = self.log_alpha.exp().item()
+        else:
+            self.alpha = self.config.get("alpha", 0.2)
+
         self.learn_step = 0
         self.collect_step = 0
 
@@ -50,10 +60,10 @@ class TD3_Agent():
             "state_shape": self.state_shape, "action_shape": self.action_shape,
             "hidden_shape": self.critic_hidden_shape, "activation": self.critic_activation,
             "hidden_activation": self.hidden_activation, "lr": self.critic_lr,
-            "clip_norm": self.clip_norm, "device": self.device
+            "clip_norm": self.clip_norm, "device": self.device,
         }
-        self.critic = TD3_Critic(**critic_kwargs).to(self.device)
-        self.critic_target = TD3_Critic(**critic_kwargs).to(self.device)
+        self.critic = SAC_Critic(**critic_kwargs).to(self.device)
+        self.critic_target = SAC_Critic(**critic_kwargs).to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
         # --- 5. 实例化训练Actor (self.device) ---
@@ -61,10 +71,11 @@ class TD3_Agent():
             "state_shape": self.state_shape, "action_shape": self.action_shape,
             "hidden_shape": self.actor_hidden_shape, "activation": self.actor_activation,
             "hidden_activation": self.hidden_activation, "lr": self.actor_lr,
-            "clip_norm": self.clip_norm, "critic": self.critic, "device": self.device
+            "clip_norm": self.clip_norm, "critic": self.critic, "device": self.device,
+            "min_log_std": self.min_log_std, "max_log_std": self.max_log_std, "log_prob_epsilon": self.log_prob_epsilon
         }
-        self.actor = TD3_Actor(**actor_kwargs).to(self.device)
-        self.actor_target = TD3_Actor(**actor_kwargs).to(self.device)
+        self.actor = SAC_Actor(**actor_kwargs).to(self.device)
+        self.actor_target = SAC_Actor(**actor_kwargs).to(self.device)
         self.actor_target.load_state_dict(self.actor.state_dict())
 
         #  --- 6. 实例化经验回放池 ---
@@ -105,18 +116,20 @@ class TD3_Agent():
         terminated_batch = torch.from_numpy(terminated_batch).float().to(self.device)
 
         with torch.no_grad():
-            next_action_batch, _ = self.actor_target.get_action(next_state_batch, deterministic=False)
-            eval_noise = (torch.randn_like(next_action_batch) * self.eval_noise_std).clamp(-self.eval_noise_bound, self.eval_noise_bound)
-            self.eval_noise_std = max(self.eval_noise_std * self.eval_noise_decay, 0.05)
-            self.eval_noise_bound = max(self.eval_noise_bound * self.eval_noise_decay, 0.01)
-            next_action_batch = (next_action_batch + eval_noise).clamp(-self.action_bound, self.action_bound)
+            next_action_batch, next_log_prob_batch = self.actor_target.get_action(next_state_batch, deterministic=False)
             next_q_batch_1, next_q_batch_2 = self.critic_target.get_value(next_state_batch, next_action_batch)
             next_q_batch = torch.min(next_q_batch_1, next_q_batch_2)
-            target_q_batch = reward_batch + self.reward_gamma * (1 - terminated_batch) * next_q_batch
+            target_q_batch = reward_batch + self.reward_gamma * (1 - terminated_batch) * (next_q_batch - self.alpha * next_log_prob_batch)
 
         self.critic.loss, td_error_batch = self.critic.train(state_batch, action_batch, target_q_batch, weight_batch)
         if self.learn_step % self.actor_train_freq == 0:
-            self.actor.loss = self.actor.train(state_batch)
+            self.actor.loss, new_log_prob_batch = self.actor.train(state_batch, self.alpha)
+            if self.auto_alpha:
+                alpha_loss = -(self.log_alpha * (new_log_prob_batch + self.target_entropy).detach()).mean()
+                self.alpha_opt.zero_grad()
+                alpha_loss.backward()
+                self.alpha_opt.step()
+                self.alpha = self.log_alpha.exp().item()
         if self.learn_step % self.update_freq == 0:
             update_target_model(self.actor.model, self.actor_target.model, self.update_tau)
             update_target_model(self.critic.model, self.critic_target.model, self.update_tau)
@@ -137,7 +150,7 @@ class TD3_Agent():
         self.actor_target.load_state_dict(torch.load(actor_path, map_location=self.device))
 
 
-class TD3_Actor(Deterministic_Actor):
+class SAC_Actor(Gaussian_Actor):
     def __init__(self, *args, **kwargs):
         self.critic =  kwargs.pop("critic")
         super().__init__(*args, **kwargs)
@@ -146,19 +159,19 @@ class TD3_Actor(Deterministic_Actor):
         self.opt = torch.optim.Adam(self.model.parameters(), lr=self.lr)
         self.loss = 0
 
-    def train(self, state_batch):
-        new_action_batch, _ = self.get_action(state_batch, deterministic=False)
+    def train(self, state_batch, alpha):
+        new_action_batch, new_log_prob_batch = self.get_action(state_batch, deterministic=False)
         q1_batch, q2_batch = self.critic.get_value(state_batch, new_action_batch)
         q_batch = torch.min(q1_batch, q2_batch)
-        loss = -1 * torch.mean(q_batch)
+        loss = -1 * torch.mean(q_batch - alpha * new_log_prob_batch)
         self.opt.zero_grad()
         loss.backward()
         clip_by_local_norm(self.model.parameters(), self.clip_norm)
         self.opt.step()
-        return loss.item()
+        return loss.item(), new_log_prob_batch.detach()
 
 
-class TD3_Critic(Twin_Q_Critic):
+class SAC_Critic(Twin_Q_Critic):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.lr = self.config["lr"]

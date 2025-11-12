@@ -3,8 +3,8 @@
 */.idea
 /__pycache__
 */__pycache__
-/Log
-/Model
+/Logs
+/Models
 
 # file 不需要提交的文件
 config.ini

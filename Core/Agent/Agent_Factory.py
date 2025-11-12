@@ -32,6 +32,7 @@ class Agent():
         learner_config = copy.deepcopy(self.agent_config)
         learner_config["index"] = "learner_0"
         learner_config["device"] = self.learner_device
+        learner_config["collector_device"] = self.collector_device
         learner_config["all_weight_queues"] = self.all_weight_queues
         learner_config["sample_queue"] = self.sample_queue
         learner_config["error_queue"] = self.error_queue
@@ -47,7 +48,7 @@ class Agent():
         self.collector = self.collector_class(**collector_config)
         print(f"[{self.collector.index}] 启动在 {self.collector.device}")
 
-        self.learner._distribute_weights()
+        self.learner._distribute_weights(device=self.collector_device)
         print(f"[{self.learner.index}] 已分发初始权重")
         self.collector._check_for_new_weights()
         print(f"[{self.collector.index}] 收到初始权重, 开始采集")
@@ -59,8 +60,8 @@ class Agent():
         self.replay_buffer = buffer_create(self.buffer_config)
         self.prioritized_replay = True if self.buffer_config.get("class") == "Prioritized_Replay_Buffer" else False
 
-    def get_action(self, state):
-        return self.collector.get_action(state)
+    def get_action(self, state, deterministic=False):
+        return self.collector.get_action(state, deterministic)
 
     def remember(self, experience):
         self.collector.remember(experience)
@@ -88,7 +89,7 @@ class Agent():
 
     def model_load(self, file_path, index=None):
         self.learner.model_load(file_path, index)
-        self.learner._distribute_weights()
+        self.learner._distribute_weights(device=self.collector_device)
 
 
 class Factory():
@@ -123,6 +124,7 @@ class Factory():
             learner_config = copy.deepcopy(self.agent_config)
             learner_config["index"] = f"learner_{i}"
             learner_config["device"] = self.learner_device
+            learner_config["collector_device"] = self.collector_device
             learner_config["all_weight_queues"] = self.all_weight_queues
             learner_config["sample_queue"] = self.sample_queue
             learner_config["error_queue"] = self.error_queue

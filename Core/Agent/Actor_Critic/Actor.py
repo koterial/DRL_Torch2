@@ -16,7 +16,7 @@ class Deterministic_Actor():
         }
         self.model = Base_MLP(**self.mlp_config)
 
-    def get_action(self, *state_batch, deterministic=True, with_log_prob=False):
+    def get_action(self, *state_batch, deterministic=False, with_log_prob=False):
         action_batch = self.model(*state_batch)
         log_prob_batch = None
         return action_batch, log_prob_batch
@@ -42,13 +42,14 @@ class Gaussian_Actor():
             "input_shape": self.config["state_shape"],
             "output_shape": [self.config["action_shape"], self.config["action_shape"]],
             "hidden_shape": self.config["hidden_shape"],
-            "activation": self.config.get("activation", ["linear", "linear"]),
+            "activation": self.config.get("activation", ["tanh", "linear"]),
             "hidden_activation": self.config.get("hidden_activation", "relu")
         }
         self.model = Base_MLP(**self.mlp_config)
 
-    def get_action(self, *state_batch, deterministic=True, with_log_prob=False):
+    def get_action(self, *state_batch, deterministic=False, with_log_prob=False):
         mu_batch, log_std_batch = self.model(*state_batch)
+        log_std_batch = torch.clamp(log_std_batch, self.min_log_std, self.max_log_std)
         std_batch = torch.exp(log_std_batch)
         dist_batch = Normal(mu_batch, std_batch)
         u_batch = dist_batch.rsample()

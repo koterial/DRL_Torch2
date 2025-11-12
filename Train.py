@@ -1,25 +1,35 @@
+import os
 import time
 import queue
 import numpy as np
 import gymnasium as gym
-import torch
 import torch.multiprocessing as mp
 from torch.utils.tensorboard import SummaryWriter
 from Core.Agent.Agent_Factory import Agent, Factory
 from Core.Agent.TD3.TD3_Roles import TD3_Learner, TD3_Collector
+from Core.Agent.SAC.SAC_Roles import SAC_Learner, SAC_Collector
 from Core.Buffer.Buffer_Create import buffer_create
 from Core.Noise.Noise_Create import noise_create
 from Env.Env_Adapter import env_adapter
 
 
-def run_agent_main(env_name, agent_config, buffer_config, max_episodes=10000, max_steps=1600, warmup_steps=10000, log_dir_root="Logs/Single Process"):
+def run_agent_main(env_name, agent_config, buffer_config, max_episodes=10000, max_steps=1600, warmup_steps=10000,
+                   log_dir_root="Logs/Single Process", model_dir_root="Models/Single Process", model_freq=100):
     print("--- 启动模式: 单进程 (Agent) ---")
+    experiment_time = time.strftime("%Y-%m-%d_%H-%M-%S")
     if SummaryWriter and log_dir_root != None:
-        log_dir = f"{log_dir_root}/{env_name}_{int(time.time())}"
+        log_dir = f"{log_dir_root}/{env_name}_{experiment_time}"
         writer = SummaryWriter(log_dir)
         print(f"[Agent] TensorBoard 日志保存至: {log_dir}")
     else:
         writer = None
+
+    if model_dir_root != None:
+        model_dir = f"{model_dir_root}/{env_name}_{experiment_time}"
+        os.makedirs(model_dir, exist_ok=True)
+        print(f"[Agent] 模型保存至: {model_dir}")
+    else:
+        model_dir = None
 
     env = gym.make(env_name)
     action_bound = float(env.action_space.high[0])
@@ -78,6 +88,8 @@ def run_agent_main(env_name, agent_config, buffer_config, max_episodes=10000, ma
             writer.add_scalar("Episode/Noise", exploration_noise.bound, episode)
             writer.add_scalar("Train/Actor Loss", agent.learner.actor.loss, episode)
             writer.add_scalar("Train/Critic Loss", agent.learner.critic.loss, episode)
+        if episode % model_freq == 0 and model_dir != None:
+            agent.model_save(model_dir)
     end_time = time.time()
     print(f"训练完成, 总用时: {(end_time - start_time) / 60:.2f} 分钟")
     env.close()
@@ -85,14 +97,23 @@ def run_agent_main(env_name, agent_config, buffer_config, max_episodes=10000, ma
         writer.close()
 
 
-def run_factory_main(env_name, agent_config, buffer_config, num_collectors=4, num_learners=1, log_dir_root="Logs/Multi Process"):
+def run_factory_main(env_name, agent_config, buffer_config, num_collectors=4, num_learners=1,
+                     log_dir_root="Logs/Multi Process", model_dir_root="Models/Multi Process"):
     print("--- 启动模式: 多进程 (Factory) ---")
     mp.set_start_method('spawn')
+    experiment_time = time.strftime("%Y-%m-%d_%H-%M-%S")
     if SummaryWriter and log_dir_root != None:
-        log_dir = f"{log_dir_root}/{env_name}_{int(time.time())}"
+        log_dir = f"{log_dir_root}/{env_name}_{experiment_time}"
         print(f"[Factory] TensorBoard 日志保存至: {log_dir}")
     else:
         log_dir = None
+
+    if model_dir_root != None:
+        model_dir = f"{model_dir_root}/{env_name}_{experiment_time}"
+        os.makedirs(model_dir, exist_ok=True)
+        print(f"[Factory] 模型保存至: {model_dir}")
+    else:
+        model_dir = None
 
     factory_config = {
         "learner_class": TD3_Learner,
@@ -119,7 +140,7 @@ def run_factory_main(env_name, agent_config, buffer_config, num_collectors=4, nu
     try:
         for i in range(factory.num_learners):
             learner_conf = factory.get_learner_config(i)
-            p_learner = mp.Process(target=run_learner_process, args=(factory.get_learner_class(), learner_conf, log_dir))
+            p_learner = mp.Process(target=run_learner_process, args=(factory.get_learner_class(), learner_conf, log_dir, model_dir))
             p_learner.start()
             processes.append(p_learner)
         for i in range(factory.num_collectors):
@@ -162,15 +183,23 @@ def run_factory_main(env_name, agent_config, buffer_config, num_collectors=4, nu
         print("所有进程已终止.")
 
 
-def run_learner_process(learner_class, learner_config, log_dir, log_freq=100):
+def run_learner_process(learner_class, learner_config, log_dir, model_dir, log_freq=100, model_freq=100):
     learner = learner_class(**learner_config)
     if SummaryWriter and log_dir != None:
         writer = SummaryWriter(f"{log_dir}/Learner_{learner.index}")
         print(f"[{learner.index}] TensorBoard 日志保存至: {log_dir}/Learner_{learner.index}")
     else:
         writer = None
+
+    if model_dir != None:
+        model_dir = f"{model_dir}/Learner_{learner.index}"
+        os.makedirs(model_dir, exist_ok=True)
+        print(f"[{learner.index}] 模型保存至: {log_dir}/Learner_{learner.index}")
+    else:
+        model_dir = None
+
     print(f"[{learner.index}] 启动在 {learner.device}")
-    learner._distribute_weights()
+    learner._distribute_weights(learner.collector_device)
     print(f"[{learner.index}] 已分发初始权重")
 
     while True:
@@ -178,6 +207,8 @@ def run_learner_process(learner_class, learner_config, log_dir, log_freq=100):
             learner.train()
             if learner.step % log_freq == 0:
                 print(f"[{learner.index}] Step: {learner.step}, Actor Loss: {learner.actor.loss:.4f}, Critic Loss: {learner.critic.loss:.4f}")
+            if learner.step % model_freq == 0  and model_dir != None:
+                learner.model_save(model_dir)
             if writer:
                 writer.add_scalar("Train/Actor Loss", learner.actor.loss, learner.step)
                 writer.add_scalar("Train/Critic Loss", learner.critic.loss, learner.step)
@@ -274,7 +305,7 @@ def run_collector_process(collector_class, collector_config, env_name, log_dir, 
 
 if __name__ == "__main__":
     multi_processing = True
-    num_collectors = 8
+    num_collectors = 1
 
     env_name = "BipedalWalker-v3"
     temp_env = gym.make(env_name)
@@ -288,7 +319,7 @@ if __name__ == "__main__":
         "reward_gamma": 0.99, "actor_train_freq": 2, "update_freq": 2, "update_tau": 0.005,
         "eval_noise_std": 0.2, "eval_noise_bound": 0.5,
         "actor_hidden_shape": [400, 300], "critic_hidden_shape": [400, 300], "hidden_activation": "relu",
-        "learner_device": "cuda" if torch.cuda.is_available() else "cpu", "collector_device": "cpu",
+        "learner_device": "cuda", "collector_device": "cpu",
     }
 
     buffer_config = {
