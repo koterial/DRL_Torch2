@@ -40,7 +40,7 @@ class Gaussian_Actor():
         self.max_log_std = self.config.get("max_log_std", 2.0)
         self.mlp_config = {
             "input_shape": self.config["state_shape"],
-            "output_shape": [self.config["action_shape"], self.config["action_shape"]],
+            "output_shape": (2, self.config["action_shape"]),
             "hidden_shape": self.config["hidden_shape"],
             "activation": self.config.get("activation", ["tanh", "linear"]),
             "hidden_activation": self.config.get("hidden_activation", "relu")

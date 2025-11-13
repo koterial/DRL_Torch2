@@ -60,7 +60,7 @@ class Twin_Q_Critic():
         self.config = copy.deepcopy(kwargs)
         self.mlp_config = {
             "input_shape": [self.config["state_shape"], self.config["action_shape"]],
-            "output_shape": [1, 1],
+            "output_shape": (2, 1),
             "hidden_shape": self.config["hidden_shape"],
             "activation": self.config.get("activation", ["linear", "linear"]),
             "hidden_activation": self.config.get("hidden_activation", "relu")
