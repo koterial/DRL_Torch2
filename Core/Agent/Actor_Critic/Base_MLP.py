@@ -1,4 +1,5 @@
 import copy
+import numpy as np
 import torch
 import torch.nn as nn
 from typing import List, Union, Tuple, Optional
@@ -7,7 +8,7 @@ from typing import List, Union, Tuple, Optional
 class Base_MLP(nn.Module):
     """
     通用的 DRL MLP 基类 (支持多输入、多输出、独立激活), 可以作为 DRL 库中 Actor 和 Critic 的通用后端.
-    input_shape 和 output_shape 均支持 int, List[int], Tuple[N, M].
+    input_shape 和 output_shape 均支持 int, List[int], Tuple[N, M] 的任意嵌套组合.
 
     --- 用例示例 ---
 
@@ -17,12 +18,12 @@ class Base_MLP(nn.Module):
         - activation: "linear"
 
     2. Q(s, a) Critic:
-        - input_shape: [state_shape, action_shape] (List[int])
+        - input_shape: [state_shape, action_shape] (List[Union[int, List, Tuple]])
         - output_shape: 1 (int)
         - activation: "linear"
 
     3. Twin Q(s, a) Critic (TD3/SAC):
-        - input_shape: [state_shape, action_shape] (List[int])
+        - input_shape: [state_shape, action_shape] (List[Union[int, List, Tuple]])
         - output_shape: (2, 1) (Tuple[int, int])/[1, 1] (List[int])
         - activation: "linear"
 
@@ -68,47 +69,12 @@ class Base_MLP(nn.Module):
         self.config = copy.deepcopy(kwargs)
 
         # --- 1. 标准化输入/输出维度 ---
-        raw_input_shape = self.config["input_shape"]
-        if isinstance(raw_input_shape, int):
-            # 案例 1: 传入 10 (e.g., V(s))
-            self.input_shape = [raw_input_shape]
-        elif isinstance(raw_input_shape, list):
-            # 案例 2: 传入 [10, 4] (e.g., Q(s,a)) or [[10], [4]]
-            if any(isinstance(i, list) for i in raw_input_shape):
-                # 展平: [[10], [4]] -> [10, 4]
-                self.input_shape = [item for sublist in raw_input_shape for item in (sublist if isinstance(sublist, list) else [sublist])]
-            else:
-                # 保持: [10, 4] -> [10, 4]
-                self.input_shape = raw_input_shape
-        elif isinstance(raw_input_shape, tuple):
-            # 案例 3: 传入 (N, M) -> (2, 10)
-            if len(raw_input_shape) != 2 or not isinstance(raw_input_shape[0], int) or not isinstance(
-                    raw_input_shape[1], int):
-                raise TypeError(f"input_shape (tuple) 必须是 (N, M) 格式, e.g., 但收到了 {raw_input_shape}")
-            num_heads = raw_input_shape[0]
-            head_dim = raw_input_shape[1]
-            self.input_shape = [head_dim] * num_heads
-        else:
-            raise TypeError(f"input_shape 必须是 int, List[int], 或 Tuple[int, int], 但收到了 {type(raw_input_shape)}")
-
-        raw_output_shape = self.config["output_shape"]
-        if isinstance(raw_output_shape, int):
-            self.output_shape = [raw_output_shape]
-        elif isinstance(raw_output_shape, list):
-            if any(isinstance(i, list) for i in raw_output_shape):
-                self.output_shape = [item for sublist in raw_output_shape for item in (sublist if isinstance(sublist, list) else [sublist])]
-            else:
-                self.output_shape = raw_output_shape
-        elif isinstance(raw_output_shape, tuple):
-            if len(raw_output_shape) != 2 or not isinstance(raw_output_shape[0], int) or not isinstance(
-                    raw_output_shape[1], int):
-                raise TypeError(f"output_shape (tuple) 必须是 (N, M) 格式, e.g., 但收到了 {raw_output_shape}")
-            num_heads = raw_output_shape[0]
-            head_dim = raw_output_shape[1]
-            self.output_shape = [head_dim] * num_heads
-        else:
-            raise TypeError(
-                f"output_shape 必须是 int, List[int], 或 Tuple[int, int], 但收到了 {type(raw_output_shape)}")
+        self.input_shape = self._flatten_shape_config(self.config["input_shape"])
+        self.output_shape = self._flatten_shape_config(self.config["output_shape"])
+        if not self.input_shape:
+            raise ValueError("input_shape 在展平后不能为空")
+        if not self.output_shape:
+            raise ValueError("output_shape 在展平后不能为空")
 
         self.hidden_shape: List[int] = self.config["hidden_shape"]
         if not self.hidden_shape:
@@ -123,6 +89,44 @@ class Base_MLP(nn.Module):
         self._is_single_output = (len(self.output_shape) == 1)
 
         self.model_create()
+
+    # 递归地将 (int, List, Tuple) 的任意组合展平为 List[int]
+    def _flatten_shape_config(self, shape_config) -> List[int]:
+        if isinstance(shape_config, int):
+            # 案例 1: 10 -> [10]
+            return [shape_config]
+        if isinstance(shape_config, list):
+            # 案例 2: [10, 4] -> [10, 4]
+            # 案例 3: [[10], [4]] -> [10, 4]
+            # 案例 4: [10, (38,)] -> [10, 38]
+            flattened_list = []
+            for item in shape_config:
+                flattened_list.extend(self._flatten_shape_config(item))
+            return flattened_list
+        if isinstance(shape_config, tuple):
+            # 案例 5: (N, M) 格式, e.g., (2, 4) 或 (2, [1, 4])
+            if (len(shape_config) == 2 and isinstance(shape_config[0], int) and shape_config[0] > 0 and isinstance(shape_config[1], (int, list, tuple))):
+                num_heads = shape_config[0]
+                head_config = shape_config[1]
+                # 递归展平子配置 (e.g., [1, 4])
+                flattened_head = self._flatten_shape_config(head_config)
+                # 将子配置重复 N 次
+                return flattened_head * num_heads
+            # 案例 6: Shape 元组, e.g., (38,) 或 (84, 84, 3)
+            else:
+                try:
+                    # 确保所有元素都是 int
+                    if not all(isinstance(i, int) for i in shape_config):
+                        raise TypeError(f"Shape tuple {shape_config} 包含 non-int 元素.")
+                    if not shape_config:  # 处理空元组 ()
+                        return []
+                    # 展平: (38,) -> [38]
+                    # 展平: (84, 84, 3) -> [21168]
+                    return [int(np.prod(shape_config))]
+                except Exception as e:
+                    raise TypeError(f"shape (tuple) {shape_config} 既不是 (N, M) 格式, 也不是有效的 shape tuple. Error: {e}")
+
+        raise TypeError(f"shape 必须是 int, List, 或 Tuple, 但收到了 {type(shape_config)}")
 
     def _get_activation(self, name: str) -> nn.Module:
         if name == "linear":
@@ -182,7 +186,7 @@ class Base_MLP(nn.Module):
             x = inputs[0]
         else:
             if len(inputs) != len(self.input_shape):
-                raise ValueError(f"模型期望 {len(self.input_shape)} 个输入 (来自 {self.config['input_shape']}), 但收到了 {len(inputs)} 个.")
+                raise ValueError(f"模型期望 {len(self.input_shape)} 个输入 (来自 {self.config['input_shape']} 展平后), 但收到了 {len(inputs)} 个.")
             try:
                 x = torch.cat(inputs, dim=-1)
             except RuntimeError as e:
@@ -285,4 +289,20 @@ if __name__ == "__main__":
     print(f"Mean shape: {mean.shape}, Log_Std shape: {log_std.shape}")
     print(f"Mean (tanh): {mean[0]}")
     print(f"Log_Std (linear): {log_std[0]}")
+    print("-" * 20)
+
+    # --- 4. 复杂嵌套输入输出 ---
+    print("--- 4. 复杂嵌套输入输出 ---")
+    complex_out_config = {
+        "input_shape": (state_shape,),
+        "output_shape": (2, [2, action_shape]),
+        # "output_shape": (2, (2, action_shape)),
+        "hidden_shape": hidden_shape,
+        "activation": ["linear", "relu", "linear", "tanh"]  # 匹配 4 个头
+    }
+    complex_out_net = Base_MLP(**complex_out_config)
+    s = torch.randn(batch_size, state_shape)
+    v1, a1, v2, a2 = complex_out_net(s)
+    print(f"Input shape: {s.shape}")
+    print(f"V1: {v1.shape}, A1: {a1.shape}, V2: {v2.shape}, A2: {a2.shape}")
     print("-" * 20)
