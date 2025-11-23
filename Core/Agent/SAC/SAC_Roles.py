@@ -21,17 +21,19 @@ class SAC_Learner():
         self.index = self.config["index"]
         self.state_shape = self.config["state_shape"]
         self.action_shape = self.config["action_shape"]
-        self.device = torch.device(self.config.get("device", "cuda"))
+        self.device = torch.device(self.config.get("learner_device", "cuda"))
         self.collector_device = torch.device(self.config.get("collector_device", "cpu"))
 
         # --- 3. 获取算法超参数 ---
         self.actor_lr = self.config.get("actor_lr", 1e-3)
         self.critic_lr = self.config.get("critic_lr", 1e-3)
         self.alpha_lr = self.config.get("alpha_lr", 1e-3)
+        self.mini_batch_shape = self.config.get("mini_batch_shape", 256)
         self.reward_gamma = self.config.get("reward_gamma", 0.99)
         self.actor_train_freq = self.config.get("actor_train_freq", 1)
         self.update_freq = self.config.get("update_freq", 2)
         self.update_tau = self.config.get("update_tau", 0.005)
+        self.distribute_freq = self.config.get("distribute_freq", 100)
         self.clip_norm = self.config.get("clip_norm", 0.5)
         self.batch_shape = int(self.config.get("batch_shape", 256))
 
@@ -100,7 +102,7 @@ class SAC_Learner():
         }
         return state_dict_on_target_device
 
-    # 训练1次
+    # 训练 num_collectors 次
     def train(self):
         try:
             # 阻塞式等待, 直到有批次可用
@@ -108,7 +110,6 @@ class SAC_Learner():
         except queue.Empty:
             print(f"[{self.index}] 等待采样批次超时...")
             return
-        self.step += 1
         if index_batch is not None:
             weight_batch = torch.from_numpy(weight_batch).float().unsqueeze(1).to(self.device)
         else:
@@ -124,21 +125,37 @@ class SAC_Learner():
             next_q_batch_1, next_q_batch_2 = self.critic_target.get_value(next_state_batch, next_action_batch)
             next_q_batch = torch.min(next_q_batch_1, next_q_batch_2)
             target_q_batch = reward_batch + self.reward_gamma * (1 - terminated_batch) * (next_q_batch - self.alpha * next_log_prob_batch)
-        self.critic.loss, td_error_batch = self.critic.train(state_batch, action_batch, target_q_batch, weight_batch)
-        if self.step % self.actor_train_freq == 0:
-            self.actor.loss, new_log_prob_batch = self.actor.train(state_batch, self.alpha)
-            if self.auto_alpha:
-                alpha_loss = -(self.log_alpha * (new_log_prob_batch + self.target_entropy).detach()).mean()
-                self.alpha_opt.zero_grad()
-                alpha_loss.backward()
-                self.alpha_opt.step()
-                self.alpha = self.log_alpha.exp().item()
-            self._distribute_weights(self.collector_device)
-        if self.step % self.update_freq == 0:
-            update_target_model(self.actor.model, self.actor_target.model, self.update_tau)
-            update_target_model(self.critic.model, self.critic_target.model, self.update_tau)
+
+        state_batch_split = torch.split(state_batch, self.mini_batch_shape)
+        action_batch_split = torch.split(action_batch, self.mini_batch_shape)
+        target_q_batch_split = torch.split(target_q_batch, self.mini_batch_shape)
+        weight_batch_split = torch.split(weight_batch, self.mini_batch_shape)
+        td_error_batch = [] if index_batch is not None else None
+        # 循环训练
+        for i in range(len(state_batch_split)):
+            state_batch_min = state_batch_split[i]
+            action_batch_min = action_batch_split[i]
+            target_q_batch_min = target_q_batch_split[i]
+            weight_batch_min = weight_batch_split[i]
+            self.step += 1
+            self.critic.loss, td_error_batch_min = self.critic.train(state_batch_min, action_batch_min, target_q_batch_min, weight_batch_min)
+            if index_batch is not None:
+                td_error_batch.append(td_error_batch_min.detach())
+            if self.step % self.actor_train_freq == 0:
+                self.actor.loss, new_log_prob_batch = self.actor.train(state_batch_min, self.alpha)
+                if self.auto_alpha:
+                    alpha_loss = -(self.log_alpha * (new_log_prob_batch + self.target_entropy).detach()).mean()
+                    self.alpha_opt.zero_grad()
+                    alpha_loss.backward()
+                    self.alpha_opt.step()
+                    self.alpha = self.log_alpha.exp().item()
+                if self.step % (self.update_freq * self.distribute_freq * len(state_batch_split)) == 0:
+                    self._distribute_weights(self.collector_device)
+            if self.step % self.update_freq == 0:
+                update_target_model(self.actor.model, self.actor_target.model, self.update_tau)
+                update_target_model(self.critic.model, self.critic_target.model, self.update_tau)
         if index_batch is not None:
-            td_error_batch = td_error_batch.squeeze(1).detach().cpu().numpy()
+            td_error_batch = torch.cat(td_error_batch, dim=0).squeeze(1).cpu().numpy()
             self.error_queue.put((index_batch, td_error_batch))
 
     def model_save(self, file_path):
@@ -167,7 +184,7 @@ class SAC_Collector():
         self.index = self.config["index"]
         self.state_shape = self.config["state_shape"]
         self.action_shape = self.config["action_shape"]
-        self.device = torch.device(self.config.get("device", "cpu"))
+        self.device = torch.device(self.config.get("collector_device", "cpu"))
 
         # --- 3. 获取算法超参数 ---
         self.actor_hidden_shape = self.config.get("actor_hidden_shape", [256, 256])

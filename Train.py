@@ -305,7 +305,7 @@ def run_collector_process(collector_class, collector_config, env_name, log_dir, 
 
 if __name__ == "__main__":
     multi_processing = True
-    num_collectors = 1
+    num_collectors = 4
 
     env_name = "BipedalWalker-v3"
     temp_env = gym.make(env_name)

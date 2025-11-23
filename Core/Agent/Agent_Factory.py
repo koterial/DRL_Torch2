@@ -31,8 +31,7 @@ class Agent():
         # --- 4. 创建 Learner ---
         learner_config = copy.deepcopy(self.agent_config)
         learner_config["index"] = "learner_0"
-        learner_config["device"] = self.learner_device
-        learner_config["collector_device"] = self.collector_device
+        learner_config["mini_batch_shape"] = int(self.agent_config.get("batch_shape", 256))
         learner_config["all_weight_queues"] = self.all_weight_queues
         learner_config["sample_queue"] = self.sample_queue
         learner_config["error_queue"] = self.error_queue
@@ -42,7 +41,6 @@ class Agent():
         # --- 5. 创建 Collector ---
         collector_config = copy.deepcopy(self.agent_config)
         collector_config["index"] = "collector_0"
-        collector_config["device"] = self.collector_device
         collector_config["experience_queue"] = self.experience_queue
         collector_config["weight_queue"] = self.weight_queue
         self.collector = self.collector_class(**collector_config)
@@ -123,8 +121,7 @@ class Factory():
         for i in range(self.num_learners):
             learner_config = copy.deepcopy(self.agent_config)
             learner_config["index"] = f"learner_{i}"
-            learner_config["device"] = self.learner_device
-            learner_config["collector_device"] = self.collector_device
+            learner_config["mini_batch_shape"] = int(self.agent_config.get("batch_shape", 256) / 1)
             learner_config["all_weight_queues"] = self.all_weight_queues
             learner_config["sample_queue"] = self.sample_queue
             learner_config["error_queue"] = self.error_queue
@@ -134,7 +131,6 @@ class Factory():
         for i in range(self.num_collectors):
             collector_config = copy.deepcopy(self.agent_config)
             collector_config["index"] = f"collector_{i}"
-            collector_config["device"] = self.collector_device
             collector_config["experience_queue"] = self.experience_queue
             collector_config["weight_queue"] = self.all_weight_queues[i]
             self.collector_configs.append(collector_config)
