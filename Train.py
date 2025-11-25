@@ -6,6 +6,7 @@ import gymnasium as gym
 import torch.multiprocessing as mp
 from torch.utils.tensorboard import SummaryWriter
 from Core.Agent.Agent_Factory import Agent, Factory
+from Core.Agent.DDPG.DDPG_Roles import DDPG_Learner, DDPG_Collector
 from Core.Agent.TD3.TD3_Roles import TD3_Learner, TD3_Collector
 from Core.Agent.SAC.SAC_Roles import SAC_Learner, SAC_Collector
 from Core.Buffer.Buffer_Create import buffer_create
@@ -33,12 +34,10 @@ def run_agent_main(env_name, agent_config, buffer_config, max_episodes=10000, ma
 
     env = gym.make(env_name)
     action_bound = float(env.action_space.high[0])
-    agent_config["state_shape"] = [env.observation_space.shape[0]]
-    agent_config["action_shape"] = [env.action_space.shape[0]]
 
     agent_facade_config = {
-        "learner_class": TD3_Learner,
-        "collector_class": TD3_Collector,
+        "learner_class": DDPG_Learner,
+        "collector_class": DDPG_Collector,
         "agent_config": agent_config,
         "buffer_config": buffer_config,
     }
@@ -126,11 +125,6 @@ def run_factory_main(env_name, agent_config, buffer_config, num_collectors=4, nu
     factory = Factory(**factory_config)
     print("Factory 创建成功, 准备启动进程")
 
-    buffer_config = factory.buffer_config
-    buffer_config["state_shape"] = agent_config["state_shape"]
-    buffer_config["action_shape"] = agent_config["action_shape"]
-    replay_buffer = buffer_create(buffer_config)
-    prioritized_replay = True if buffer_config.get("class") == "Prioritized_Replay_Buffer" else False
     batch_shape = factory.agent_config.get("batch_shape", 256)
     experience_queue = factory.get_experience_queue()
     sample_queue = factory.get_sample_queue()
@@ -153,17 +147,17 @@ def run_factory_main(env_name, agent_config, buffer_config, num_collectors=4, nu
         while True:
             try:
                 experience_batch = experience_queue.get_nowait()
-                replay_buffer.remember(experience_batch)
+                factory.replay_buffer.remember(experience_batch)
             except queue.Empty:
                 pass
-            if replay_buffer.size() > batch_shape and not sample_queue.full():
-                batch = replay_buffer.sample(batch_shape)
+            if factory.replay_buffer.size() > batch_shape and not sample_queue.full():
+                batch = factory.replay_buffer.sample(batch_shape)
                 if batch[0] is not None:
                     sample_queue.put(batch)
-            if prioritized_replay and not error_queue.empty():
+            if factory.prioritized_replay and not error_queue.empty():
                 try:
                     index_batch, error_batch = error_queue.get_nowait()
-                    replay_buffer.batch_update(index_batch, error_batch)
+                    factory.replay_buffer.batch_update(index_batch, error_batch)
                 except queue.Empty:
                     pass
             if experience_queue.empty() and sample_queue.full():

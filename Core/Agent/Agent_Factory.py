@@ -135,6 +135,12 @@ class Factory():
             collector_config["weight_queue"] = self.all_weight_queues[i]
             self.collector_configs.append(collector_config)
 
+        # --- 6. 创建 Replay Buffer ---
+        self.buffer_config["state_shape"] = self.agent_config["state_shape"]
+        self.buffer_config["action_shape"] = self.agent_config["action_shape"]
+        self.replay_buffer = buffer_create(self.buffer_config)
+        self.prioritized_replay = True if self.buffer_config.get("class") == "Prioritized_Replay_Buffer" else False
+
     def get_learner_config(self, index=0):
         return self.learner_configs[index]
 
